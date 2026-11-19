@@ -1,0 +1,50 @@
+[project]
+name = "edm-cond"
+version = "0.1.0"
+description = "Class-conditional pixel-space diffusion trained from scratch (fork of NVlabs/edm)"
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "pandas>=2.0",
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "psutil>=5.9",
+    "matplotlib>=3.7",   # tools/plot_stats.py
+]
+
+[project.optional-dependencies]
+# Pick exactly ONE torch flavour: `uv sync --extra cu126` (RTX 3090) or `uv sync --extra cpu`.
+cu126 = ["torch>=2.3"]
+cpu = ["torch>=2.3"]
+tensorboard = ["tensorboard>=2.14"]
+fid = ["scipy>=1.10"]    # optional fid.py (uses a pretrained Inception network)
+
+[dependency-groups]
+dev = ["pytest>=7.4"]
+
+[tool.uv]
+package = false          # flat scripts (train.py, generate.py, tools/), nothing to build
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

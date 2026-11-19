@@ -18,21 +18,26 @@ License: CC BY-NC-SA 4.0 (inherited from EDM, see `LICENSE.txt`).
 
 ## 1. Install
 
+Packaging uses [uv](https://docs.astral.sh/uv/). Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. Choose **one** torch flavour with an extra:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA 12.x build for the 3090
-pip install -r requirements.txt
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-')"
+curl -LsSf https://astral.sh/uv/install.sh | sh        # if uv is not installed yet
+
+uv sync --extra cu126                                  # RTX 3090: CUDA 12.6 wheels (NVIDIA driver >= 560)
+# uv sync --extra cpu                                  # CPU-only machine (tests, debugging)
+# optional extras: --extra tensorboard  (for --tensorboard=1),  --extra fid  (scipy, for fid.py)
+
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-')"
 ```
 
-Optional: `pip install tensorboard` for `--tensorboard=1`. Install `scipy` only if you want the optional `fid.py`.
+`uv sync` creates `.venv/`. Either prefix commands with `uv run` (e.g. `uv run python train.py ...`) or run `source .venv/bin/activate` once. The commands below assume the venv is active.
 
-Run the CPU test suite (about 1–2 min):
+The `cu126` extra resolves to torch 2.14.x. PyTorch publishes 2.15 only for CUDA 13.2+, which needs a very recent driver. To use a newer CUDA build, change the `pytorch-cu126` index URL in `pyproject.toml` and run `uv lock`. Pass the same `--extra` to every later `uv sync`, otherwise uv removes the torch flavour you chose. A plain `uv run` keeps what is installed.
+
+Run the CPU test suite (about 1–2 min; `pytest` is in the default `dev` group):
 
 ```bash
-python -m pytest -q tests
+uv run pytest -q
 ```
 
 ## 2. Data format, checks and preprocessing
