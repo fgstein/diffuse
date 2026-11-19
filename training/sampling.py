@@ -1,0 +1,164 @@
+# This file is part of a derivative of NVIDIA's EDM codebase and is
+# licensed under the Creative Commons Attribution-NonCommercial-ShareAlike
+# 4.0 International License (see LICENSE.txt).
+
+"""EDM sampler with classifier-free guidance, shared by generate.py and the
+training loop (sample grids)."""
+
+import numpy as np
+import torch
+import PIL.Image
+
+#----------------------------------------------------------------------------
+# Wrapper for torch.Generator that allows specifying a different random seed
+# for each sample in a minibatch (from EDM's generate.py).
+
+class StackedRandomGenerator:
+    def __init__(self, device, seeds):
+        super().__init__()
+        self.generators = [torch.Generator(device).manual_seed(int(seed) % (1 << 32)) for seed in seeds]
+
+    def randn(self, size, **kwargs):
+        assert size[0] == len(self.generators)
+        return torch.stack([torch.randn(size[1:], generator=gen, **kwargs) for gen in self.generators])
+
+    def randn_like(self, input):
+        return self.randn(input.shape, dtype=input.dtype, layout=input.layout, device=input.device)
+
+    def randint(self, *args, size, **kwargs):
+        assert size[0] == len(self.generators)
+        return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])
+
+#----------------------------------------------------------------------------
+# Classifier-free guidance on the denoiser:
+#   D = D_uncond + w * (D_cond - D_uncond)
+# computed in ONE forward pass by concatenating the cond and null batches.
+# w == 1 -> conditional only (no extra pass), w == 0 -> unconditional only.
+# guidance_interval=(smin, smax): apply guidance only for sigma in that range,
+# w = 1 elsewhere (Kynkaanniemi et al. 2024).
+
+def _cat_cond(a, b):
+    return {k: torch.cat([a[k], b[k]]) for k in a}
+
+def guided_denoise(net, x, sigma, cond, guidance=1.0, guidance_interval=None, null_cond=None):
+    w = float(guidance)
+    if guidance_interval is not None:
+        s = float(sigma)
+        if not (guidance_interval[0] <= s <= guidance_interval[1]):
+            w = 1.0
+    if w == 1.0:
+        return net(x, sigma, cond)
+    if null_cond is None:
+        null_cond = net.null_cond(x.shape[0], x.device)
+    if w == 0.0:
+        return net(x, sigma, null_cond)
+    D = net(torch.cat([x, x]), sigma, _cat_cond(cond, null_cond))
+    D_cond, D_uncond = D.chunk(2)
+    return D_uncond + w * (D_cond - D_uncond)
+
+#----------------------------------------------------------------------------
+# Proposed EDM sampler (Algorithm 2), with CFG.
+
+def edm_sampler(
+    net, latents, cond=None, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    guidance=1.0, guidance_interval=None,
+):
+    # Canonicalize the condition dict once (also accepts legacy label tensors / None).
+    cond = net.cond_stack.normalize(cond, n=latents.shape[0], device=latents.device)
+    null_cond = net.null_cond(latents.shape[0], latents.device)
+    denoise = lambda x, t: guided_denoise(net, x, t, cond, guidance=guidance,
+        guidance_interval=guidance_interval, null_cond=null_cond).to(torch.float64)
+
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+
+    # Time step discretization.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+
+    # Main sampling loop.
+    x_next = latents.to(torch.float64) * t_steps[0]
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        x_cur = x_next
+
+        # Increase noise temporarily.
+        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+        t_hat = net.round_sigma(t_cur + gamma * t_cur)
+        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+
+        # Euler step.
+        denoised = denoise(x_hat, t_hat)
+        d_cur = (x_hat - denoised) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+
+        # Apply 2nd order correction.
+        if i < num_steps - 1:
+            denoised = denoise(x_next, t_next)
+            d_prime = (x_next - denoised) / t_next
+            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+    return x_next
+
+#----------------------------------------------------------------------------
+# Convenience: generate images for explicit (seed, class index) pairs.
+
+@torch.no_grad()
+def generate(net, seeds, class_indices, device, guidance=1.0, num_steps=32, sigma_max=80.0,
+             sigma_min=0.002, rho=7, batch_size=64, guidance_interval=None, **sampler_kwargs):
+    """Returns uint8 images [N, C, H, W] (CPU). class_indices may be None (unconditional)."""
+    out = []
+    for start in range(0, len(seeds), batch_size):
+        bseeds = seeds[start:start + batch_size]
+        rnd = StackedRandomGenerator(device, bseeds)
+        latents = rnd.randn([len(bseeds), net.img_channels, net.img_resolution, net.img_resolution], device=device)
+        cond = None
+        if class_indices is not None and 'class' in net.cond_stack.names:
+            cond = {'class': torch.as_tensor(class_indices[start:start + batch_size], dtype=torch.int64, device=device)}
+        x = edm_sampler(net, latents, cond, randn_like=rnd.randn_like, num_steps=num_steps,
+            sigma_min=sigma_min, sigma_max=sigma_max, rho=rho, guidance=guidance,
+            guidance_interval=guidance_interval, **sampler_kwargs)
+        out.append(to_uint8(x).cpu())
+    return torch.cat(out)
+
+def to_uint8(x):
+    return (x * 127.5 + 128).clip(0, 255).to(torch.uint8)
+
+#----------------------------------------------------------------------------
+# Image grids.
+
+def make_grid(images, rows, cols, pad=2, pad_value=255):
+    """images: uint8 [rows*cols, C, H, W] -> uint8 HWC numpy grid."""
+    images = torch.as_tensor(images)
+    n, C, H, W = images.shape
+    assert n == rows * cols, (n, rows, cols)
+    grid = torch.full([C, rows * (H + pad) + pad, cols * (W + pad) + pad], pad_value, dtype=torch.uint8)
+    for i in range(n):
+        r, c = divmod(i, cols)
+        y0, x0 = pad + r * (H + pad), pad + c * (W + pad)
+        grid[:, y0:y0 + H, x0:x0 + W] = images[i]
+    return grid.permute(1, 2, 0).numpy()
+
+def hconcat(grids, gap=8, pad_value=255):
+    """Concatenate HWC uint8 grids horizontally with a gap (heights are padded to the max)."""
+    H = max(g.shape[0] for g in grids)
+    C = grids[0].shape[2]
+    parts = []
+    for i, g in enumerate(grids):
+        if g.shape[0] < H:
+            g = np.concatenate([g, np.full([H - g.shape[0], g.shape[1], C], pad_value, np.uint8)], axis=0)
+        parts.append(g)
+        if i < len(grids) - 1:
+            parts.append(np.full([H, gap, C], pad_value, np.uint8))
+    return np.concatenate(parts, axis=1)
+
+def save_image(arr, path):
+    arr = np.asarray(arr)
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+    PIL.Image.fromarray(arr, 'L' if arr.ndim == 2 else 'RGB').save(path)
+
+#----------------------------------------------------------------------------

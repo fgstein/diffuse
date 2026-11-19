@@ -5,7 +5,11 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Script for calculating Frechet Inception Distance (FID)."""
+"""OPTIONAL: Frechet Inception Distance. Downloads a PRETRAINED Inception-v3 network,
+so it is NOT part of the training path and is of limited meaning for data that is far
+from ImageNet. Kept from EDM for convenience only.
+
+Script for calculating Frechet Inception Distance (FID)."""
 
 import os
 import click
@@ -22,11 +26,11 @@ from training import dataset
 
 def calculate_inception_stats(
     image_path, num_expected=None, seed=0, max_batch_size=64,
-    num_workers=3, prefetch_factor=2, device=torch.device('cuda'),
+    num_workers=3, prefetch_factor=2, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 ):
     # Rank 0 goes first.
     if dist.get_rank() != 0:
-        torch.distributed.barrier()
+        dist.barrier()
 
     # Load Inception-v3 model.
     # This is a direct PyTorch translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
@@ -47,7 +51,7 @@ def calculate_inception_stats(
 
     # Other ranks follow.
     if dist.get_rank() == 0:
-        torch.distributed.barrier()
+        dist.barrier()
 
     # Divide images into batches.
     num_batches = ((len(dataset_obj) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
@@ -60,7 +64,7 @@ def calculate_inception_stats(
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
     sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
     for images, _labels in tqdm.tqdm(data_loader, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
+        dist.barrier()
         if images.shape[0] == 0:
             continue
         if images.shape[1] == 1:
@@ -70,8 +74,9 @@ def calculate_inception_stats(
         sigma += features.T @ features
 
     # Calculate grand totals.
-    torch.distributed.all_reduce(mu)
-    torch.distributed.all_reduce(sigma)
+    if dist.get_world_size() > 1:
+        torch.distributed.all_reduce(mu)
+        torch.distributed.all_reduce(sigma)
     mu /= len(dataset_obj)
     sigma -= mu.ger(mu) * len(dataset_obj)
     sigma /= len(dataset_obj) - 1
@@ -133,7 +138,7 @@ def calc(image_path, ref_path, num_expected, seed, batch):
     if dist.get_rank() == 0:
         fid = calculate_fid_from_inception_stats(mu, sigma, ref['mu'], ref['sigma'])
         print(f'{fid:g}')
-    torch.distributed.barrier()
+    dist.barrier()
 
 #----------------------------------------------------------------------------
 
@@ -154,7 +159,7 @@ def ref(dataset_path, dest_path, batch):
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         np.savez(dest_path, mu=mu, sigma=sigma)
 
-    torch.distributed.barrier()
+    dist.barrier()
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------

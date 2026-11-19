@@ -1,0 +1,30 @@
+# 224x224 native preset for a single RTX 3090 (Simple-Diffusion style).
+# UNTUNED starting point -- see README "Moving to 224 px".
+# Explicit command-line flags override every value here.
+resolution: 224
+arch: ddpmpp
+patch_size: 2                # 224 -> 112 internal resolution (pixel_unshuffle)
+model_channels: 128
+channel_mult: [1, 2, 3, 4]   # feature maps 112, 56, 28, 14
+num_blocks: 2
+attn_res: [28, 14]           # attention only at low resolution (+ bottleneck)
+noise_shift_base: 64         # P_mean_eff = P_mean + ln(224/64) = P_mean + 1.25
+P_mean: -1.2
+P_std: 1.2
+precision: bf16
+grad_ckpt: true
+batch: 128
+batch_gpu: 32
+lr: 1.0e-4
+lr_rampup_kimg: 2000
+ema: 0.5
+dropout: 0.1
+label_dropout: 0.1
+augment: 0.0
+xflip: false
+duration: 20                 # Mimg; set from measured sec/kimg (see README)
+tick: 25
+snap: 20
+dump: 100
+sample_every: 20
+val_every: 20

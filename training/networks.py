@@ -6,12 +6,22 @@
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 """Model architectures and preconditioning schemes used in the paper
-"Elucidating the Design Space of Diffusion-Based Generative Models"."""
+"Elucidating the Design Space of Diffusion-Based Generative Models".
+
+Modified for class-conditional pixel-space training:
+  - modular conditioning (training/conditioning.py) instead of one-hot x Linear,
+  - configurable topology with validation, input patching (pixel (un)shuffle),
+  - attention via torch.nn.functional.scaled_dot_product_attention,
+  - optional gradient checkpointing,
+  - mixed precision via torch.autocast (fp32 | fp16 | bf16) in EDMPrecond.
+"""
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from torch_utils import persistence
 from torch.nn.functional import silu
+from training.conditioning import ConditionStack, make_class_cond_config
 
 #----------------------------------------------------------------------------
 # Unified routine for initializing weights and biases.
@@ -106,24 +116,35 @@ class GroupNorm(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
-# Attention weight computation, i.e., softmax(Q^T * K).
-# Performs all computation using FP32, but uses the original datatype for
-# inputs/outputs/gradients to conserve memory.
+# Topology validation shared by both UNets.
 
-class AttentionOp(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
-        ctx.save_for_backward(q, k, w)
-        return w
+def validate_topology(img_resolution, patch_size, channel_mult, attn_resolutions):
+    """Raise a readable ValueError if the requested UNet topology is impossible."""
+    if patch_size < 1:
+        raise ValueError(f'patch_size must be >= 1, got {patch_size}')
+    if img_resolution % patch_size != 0:
+        raise ValueError(f'Resolution {img_resolution} is not divisible by patch size {patch_size}.')
+    res = img_resolution // patch_size
+    levels = len(channel_mult)
+    if levels < 1:
+        raise ValueError('channel_mult must have at least one entry.')
+    factor = 2 ** (levels - 1)
+    if res % factor != 0:
+        raise ValueError(f'Internal resolution {res} (= resolution {img_resolution} / patch size {patch_size}) '
+            f'must be divisible by 2^(len(channel_mult)-1) = {factor} for channel_mult={list(channel_mult)}.')
+    valid = [res >> level for level in range(levels)]
+    bad = [r for r in attn_resolutions if r not in valid]
+    if bad:
+        raise ValueError(f'Attention resolution(s) {bad} do not occur in the UNet; '
+            f'available feature-map resolutions are {valid} (resolution {img_resolution}, patch size {patch_size}).')
+    return res
 
-    @staticmethod
-    def backward(ctx, dw):
-        q, k, w = ctx.saved_tensors
-        db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
-        dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
-        dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
-        return dq, dk
+def _resolve_cond_config(cond_config, label_dim, label_dropout):
+    if cond_config is not None:
+        return [dict(c) for c in cond_config]
+    if label_dim:
+        return make_class_cond_config(num_classes=label_dim, dropout=label_dropout)
+    return []
 
 #----------------------------------------------------------------------------
 # Unified U-Net block with optional up/downsampling and self-attention.
@@ -142,7 +163,9 @@ class UNetBlock(torch.nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.emb_channels = emb_channels
-        self.num_heads = 0 if not attention else num_heads if num_heads is not None else out_channels // channels_per_head
+        self.num_heads = 0 if not attention else num_heads if num_heads is not None else max(out_channels // channels_per_head, 1)
+        if self.num_heads and out_channels % self.num_heads != 0:
+            raise ValueError(f'Attention: {out_channels} channels not divisible by {self.num_heads} heads.')
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
@@ -179,10 +202,13 @@ class UNetBlock(torch.nn.Module):
         x = x * self.skip_scale
 
         if self.num_heads:
-            q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
-            a = torch.einsum('nqk,nck->ncq', w, v)
-            x = self.proj(a.reshape(*x.shape)).add_(x)
+            N, C, H, W = x.shape
+            # Same channel layout as the original EDM AttentionOp => old checkpoints stay compatible.
+            q, k, v = self.qkv(self.norm2(x)).reshape(N, self.num_heads, C // self.num_heads, 3, H * W).unbind(3)
+            q, k, v = (t.transpose(-1, -2) for t in (q, k, v)) # [N, heads, HW, C/heads]
+            a = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            a = a.transpose(-1, -2).reshape(N, C, H, W)
+            x = self.proj(a).add_(x)
             x = x * self.skip_scale
         return x
 
@@ -241,6 +267,12 @@ class SongUNet(torch.nn.Module):
         attn_resolutions    = [16],         # List of resolutions with self-attention.
         dropout             = 0.10,         # Dropout probability of intermediate activations.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        cond_config         = None,         # Condition config (list of dicts), None = derive from label_dim/label_dropout.
+        joint_dropout       = 0,            # Probability of dropping all conditions of a sample jointly.
+        num_heads           = 1,            # Attention heads (None = use head_channels).
+        head_channels       = None,         # Channels per attention head (overrides num_heads if set).
+        patch_size          = 1,            # Input patching: pixel_unshuffle(p) at input, pixel_shuffle(p) at output.
+        grad_ckpt           = False,        # Gradient checkpointing of UNet blocks during training.
 
         embedding_type      = 'positional', # Timestep embedding type: 'positional' for DDPM++, 'fourier' for NCSN++.
         channel_mult_noise  = 1,            # Timestep embedding size: 1 for DDPM++, 2 for NCSN++.
@@ -253,21 +285,29 @@ class SongUNet(torch.nn.Module):
         assert decoder_type in ['standard', 'skip']
 
         super().__init__()
-        self.label_dropout = label_dropout
+        self.img_resolution = img_resolution
+        self.patch_size = patch_size
+        self.grad_ckpt = grad_ckpt
+        img_resolution = validate_topology(img_resolution, patch_size, channel_mult, attn_resolutions)
+        in_channels = in_channels * patch_size ** 2
+        out_channels = out_channels * patch_size ** 2
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
+        if head_channels is not None:
+            num_heads = None
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
         block_kwargs = dict(
-            emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
+            emb_channels=emb_channels, num_heads=num_heads, channels_per_head=(head_channels or 64), dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
             init=init, init_zero=init_zero, init_attn=init_attn,
         )
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
-        self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
+        self.cond_config = _resolve_cond_config(cond_config, label_dim, label_dropout)
+        self.cond_stack = ConditionStack(self.cond_config, emb_dim=noise_channels, joint_dropout=joint_dropout)
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
         self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
         self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
@@ -317,15 +357,23 @@ class SongUNet(torch.nn.Module):
                 self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 self.dec[f'{res}x{res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+    def _run_block(self, block, x, emb):
+        if self.grad_ckpt and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(block, x, emb, use_reentrant=False)
+        return block(x, emb)
+
+    def forward(self, x, noise_labels, cond=None, augment_labels=None, class_labels=None):
+        if cond is None:
+            cond = class_labels # backward compatibility
+        if self.patch_size > 1:
+            x = torch.nn.functional.pixel_unshuffle(x, self.patch_size)
+
         # Mapping.
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
-        if self.map_label is not None:
-            tmp = class_labels
-            if self.training and self.label_dropout:
-                tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
-            emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+        cond_emb = self.cond_stack(cond, n=x.shape[0], device=x.device)
+        if cond_emb is not None:
+            emb = emb + cond_emb.to(emb.dtype)
         if self.map_augment is not None and augment_labels is not None:
             emb = emb + self.map_augment(augment_labels)
         emb = silu(self.map_layer0(emb))
@@ -342,7 +390,7 @@ class SongUNet(torch.nn.Module):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+                x = self._run_block(block, x, emb) if isinstance(block, UNetBlock) else block(x)
                 skips.append(x)
 
         # Decoder.
@@ -359,7 +407,9 @@ class SongUNet(torch.nn.Module):
             else:
                 if x.shape[1] != block.in_channels:
                     x = torch.cat([x, skips.pop()], dim=1)
-                x = block(x, emb)
+                x = self._run_block(block, x, emb)
+        if self.patch_size > 1:
+            aux = torch.nn.functional.pixel_shuffle(aux, self.patch_size)
         return aux
 
 #----------------------------------------------------------------------------
@@ -382,22 +432,34 @@ class DhariwalUNet(torch.nn.Module):
         channel_mult_emb    = 4,            # Multiplier for the dimensionality of the embedding vector.
         num_blocks          = 3,            # Number of residual blocks per resolution.
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
-        dropout             = 0.10,         # List of resolutions with self-attention.
+        dropout             = 0.10,         # Dropout probability of intermediate activations.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        cond_config         = None,         # Condition config (list of dicts), None = derive from label_dim/label_dropout.
+        joint_dropout       = 0,            # Probability of dropping all conditions of a sample jointly.
+        num_heads           = None,         # Attention heads (None = use head_channels).
+        head_channels       = 64,           # Channels per attention head (used if num_heads is None).
+        patch_size          = 1,            # Input patching: pixel_unshuffle(p) at input, pixel_shuffle(p) at output.
+        grad_ckpt           = False,        # Gradient checkpointing of UNet blocks during training.
     ):
         super().__init__()
-        self.label_dropout = label_dropout
+        self.img_resolution = img_resolution
+        self.patch_size = patch_size
+        self.grad_ckpt = grad_ckpt
+        img_resolution = validate_topology(img_resolution, patch_size, channel_mult, attn_resolutions)
+        in_channels = in_channels * patch_size ** 2
+        out_channels = out_channels * patch_size ** 2
         emb_channels = model_channels * channel_mult_emb
         init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
         init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
-        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
+        block_kwargs = dict(emb_channels=emb_channels, num_heads=num_heads, channels_per_head=(head_channels or 64), dropout=dropout, init=init, init_zero=init_zero)
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels)
         self.map_augment = Linear(in_features=augment_dim, out_features=model_channels, bias=False, **init_zero) if augment_dim else None
         self.map_layer0 = Linear(in_features=model_channels, out_features=emb_channels, **init)
         self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
-        self.map_label = Linear(in_features=label_dim, out_features=emb_channels, bias=False, init_mode='kaiming_normal', init_weight=np.sqrt(label_dim)) if label_dim else None
+        self.cond_config = _resolve_cond_config(cond_config, label_dim, label_dropout)
+        self.cond_stack = ConditionStack(self.cond_config, emb_dim=emb_channels, joint_dropout=joint_dropout)
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
@@ -432,32 +494,42 @@ class DhariwalUNet(torch.nn.Module):
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels, class_labels, augment_labels=None):
-        # Mapping.
+    def _run_block(self, block, x, emb):
+        if self.grad_ckpt and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(block, x, emb, use_reentrant=False)
+        return block(x, emb)
+
+    def forward(self, x, noise_labels, cond=None, augment_labels=None, class_labels=None):
+        if cond is None:
+            cond = class_labels # backward compatibility
+        if self.patch_size > 1:
+            x = torch.nn.functional.pixel_unshuffle(x, self.patch_size)
+
+        # Mapping. (As in ADM/EDM, the condition is added after the second mapping layer.)
         emb = self.map_noise(noise_labels)
         if self.map_augment is not None and augment_labels is not None:
             emb = emb + self.map_augment(augment_labels)
         emb = silu(self.map_layer0(emb))
         emb = self.map_layer1(emb)
-        if self.map_label is not None:
-            tmp = class_labels
-            if self.training and self.label_dropout:
-                tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
-            emb = emb + self.map_label(tmp)
+        cond_emb = self.cond_stack(cond, n=x.shape[0], device=x.device)
+        if cond_emb is not None:
+            emb = emb + cond_emb.to(emb.dtype)
         emb = silu(emb)
 
         # Encoder.
         skips = []
         for block in self.enc.values():
-            x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+            x = self._run_block(block, x, emb) if isinstance(block, UNetBlock) else block(x)
             skips.append(x)
 
         # Decoder.
         for block in self.dec.values():
             if x.shape[1] != block.in_channels:
                 x = torch.cat([x, skips.pop()], dim=1)
-            x = block(x, emb)
+            x = self._run_block(block, x, emb)
         x = self.out_conv(silu(self.out_norm(x)))
+        if self.patch_size > 1:
+            x = torch.nn.functional.pixel_shuffle(x, self.patch_size)
         return x
 
 #----------------------------------------------------------------------------
@@ -628,13 +700,16 @@ class iDDPMPrecond(torch.nn.Module):
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
 
+_PRECISION_DTYPES = {'fp32': None, 'fp16': torch.float16, 'bf16': torch.bfloat16}
+
 @persistence.persistent_class
 class EDMPrecond(torch.nn.Module):
     def __init__(self,
         img_resolution,                     # Image resolution.
         img_channels,                       # Number of color channels.
-        label_dim       = 0,                # Number of class labels, 0 = unconditional.
-        use_fp16        = False,            # Execute the underlying model at FP16 precision?
+        label_dim       = 0,                # Number of class labels, 0 = unconditional (legacy; prefer cond_config).
+        use_fp16        = False,            # Legacy: equivalent to precision='fp16'.
+        precision       = 'fp32',           # Autocast precision of the UNet: 'fp32' | 'fp16' | 'bf16'.
         sigma_min       = 0,                # Minimum supported noise level.
         sigma_max       = float('inf'),     # Maximum supported noise level.
         sigma_data      = 0.5,              # Expected standard deviation of the training data.
@@ -642,28 +717,49 @@ class EDMPrecond(torch.nn.Module):
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
         super().__init__()
+        if use_fp16:
+            precision = 'fp16'
+        if precision not in _PRECISION_DTYPES:
+            raise ValueError(f'Unknown precision "{precision}"; expected one of {list(_PRECISION_DTYPES)}')
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.label_dim = label_dim
-        self.use_fp16 = use_fp16
+        self.use_fp16 = (precision == 'fp16')
+        self.precision = precision
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
 
-    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+    @property
+    def cond_stack(self):
+        return self.model.cond_stack
+
+    @property
+    def cond_config(self):
+        return self.model.cond_config
+
+    def null_cond(self, n, device):
+        """Raw condition dict meaning 'unconditional' (for classifier-free guidance)."""
+        return self.cond_stack.null_cond(n, device)
+
+    def forward(self, x, sigma, cond=None, force_fp32=False, class_labels=None, **model_kwargs):
+        if cond is None:
+            cond = class_labels # backward compatibility: net(x, sigma, class_labels)
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+        if sigma.shape[0] == 1 and x.shape[0] > 1:
+            sigma = sigma.expand(x.shape[0], 1, 1, 1)
+        cond = self.cond_stack.normalize(cond, n=x.shape[0], device=x.device)
+        amp_dtype = None if force_fp32 else _PRECISION_DTYPES[self.precision]
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
-        assert F_x.dtype == dtype
+        with torch.autocast(device_type=x.device.type, dtype=(amp_dtype or torch.bfloat16), enabled=(amp_dtype is not None)):
+            F_x = self.model(c_in * x, c_noise.flatten(), cond=cond, **model_kwargs)
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x
 

@@ -141,6 +141,52 @@ class InfiniteSampler(torch.utils.data.Sampler):
             idx += 1
 
 #----------------------------------------------------------------------------
+# Resumable infinite sampler with optional per-item weights.
+#
+# The global stream of indices is a concatenation of "epochs". Epoch e is a
+# permutation of the dataset (or, if `weights` is given, len(dataset) draws
+# with replacement proportional to the weights), generated from
+# RandomState(seed + e). Rank r yields the global items r, r+W, r+2W, ...
+# `start_idx` skips the first start_idx *global* items in O(1), so resuming
+# from cur_nimg continues the exact same data order.
+
+class ResumableInfiniteSampler(torch.utils.data.Sampler):
+    def __init__(self, num_items, rank=0, num_replicas=1, seed=0, weights=None, start_idx=0):
+        assert num_items > 0
+        assert num_replicas > 0
+        assert 0 <= rank < num_replicas
+        super().__init__()
+        self.num_items = int(num_items)
+        self.rank = rank
+        self.num_replicas = num_replicas
+        self.seed = int(seed)
+        self.weights = None
+        if weights is not None:
+            w = np.asarray(weights, dtype=np.float64)
+            assert w.shape == (self.num_items,) and np.all(w >= 0) and w.sum() > 0
+            self.weights = w / w.sum()
+        self.start_idx = int(start_idx)
+
+    def _epoch_order(self, epoch):
+        rnd = np.random.RandomState((self.seed + epoch) % (1 << 31))
+        if self.weights is None:
+            return rnd.permutation(self.num_items)
+        return rnd.choice(self.num_items, size=self.num_items, replace=True, p=self.weights)
+
+    def __iter__(self):
+        # First global index >= start_idx that belongs to this rank.
+        g = self.start_idx + ((self.rank - self.start_idx) % self.num_replicas)
+        epoch = g // self.num_items
+        order = self._epoch_order(epoch)
+        while True:
+            e, i = divmod(g, self.num_items)
+            if e != epoch:
+                epoch = e
+                order = self._epoch_order(epoch)
+            yield int(order[i])
+            g += self.num_replicas
+
+#----------------------------------------------------------------------------
 # Utilities for operating with torch.nn.Module parameters and buffers.
 
 def params_and_buffers(module):
@@ -157,7 +203,7 @@ def copy_params_and_buffers(src_module, dst_module, require_all=False):
     assert isinstance(dst_module, torch.nn.Module)
     src_tensors = dict(named_params_and_buffers(src_module))
     for name, tensor in named_params_and_buffers(dst_module):
-        assert (name in src_tensors) or (not require_all)
+        assert (name in src_tensors) or (not require_all), f'Missing tensor in source module: {name}'
         if name in src_tensors:
             tensor.copy_(src_tensors[name])
 
@@ -186,6 +232,8 @@ def check_ddp_consistency(module, ignore_regex=None):
         tensor = tensor.detach()
         if tensor.is_floating_point():
             tensor = nan_to_num(tensor)
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return # single process: nothing to check
         other = tensor.clone()
         torch.distributed.broadcast(tensor=other, src=0)
         assert (tensor == other).all(), fullname

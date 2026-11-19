@@ -1,0 +1,16 @@
+# Install PyTorch first with the CUDA 12.x wheel matching your driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.3
+numpy>=1.24
+pillow>=10.0
+pandas>=2.0
+click>=8.1
+pyyaml>=6.0
+tqdm>=4.66
+psutil>=5.9
+matplotlib>=3.7      # tools/plot_stats.py
+pytest>=7.4          # tests
+# Optional:
+# scipy>=1.10        # fid.py (optional, uses a pretrained Inception network)
+# tensorboard>=2.14  # --tensorboard=1
+# pyspng             # faster PNG decoding (legacy EDM dataset class)

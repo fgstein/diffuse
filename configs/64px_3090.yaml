@@ -1,0 +1,29 @@
+# 64x64 class-conditional preset for a single RTX 3090 (24 GB).
+# DDPM++-style SongUNet. UNTUNED starting point -- see README "Sizing a run".
+# Explicit command-line flags override every value here.
+resolution: 64
+arch: ddpmpp
+model_channels: 128
+channel_mult: [1, 2, 2, 2]   # feature maps 64, 32, 16, 8
+num_blocks: 3
+attn_res: [16, 8]
+dropout: 0.1
+label_dropout: 0.1
+patch_size: 1
+precision: bf16
+grad_ckpt: false
+batch: 256
+batch_gpu: 128               # gradient accumulation if the whole batch does not fit
+lr: 2.0e-4
+lr_rampup_kimg: 2000
+ema: 0.5                     # EMA half-life in Mimg
+P_mean: -1.2
+P_std: 1.2
+augment: 0.0
+xflip: false
+duration: 40                 # Mimg; set from measured sec/kimg (see README)
+tick: 50                     # kimg per tick
+snap: 20                     # ticks
+dump: 100                    # ticks
+sample_every: 20             # ticks
+val_every: 20                # ticks
