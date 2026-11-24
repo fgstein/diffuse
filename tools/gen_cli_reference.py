@@ -23,6 +23,7 @@ SCRIPTS = [
     ('tools/plot_stats.py', 'tools.plot_stats', 'main'),
     ('tools/memorization_check.py', 'tools.memorization_check', 'main'),
     ('tools/translate.py', 'tools.translate', 'main'),
+    ('tools/style_mosaic.py', 'tools.style_mosaic', 'main'),
     ('tools/domain_gap.py', 'tools.domain_gap', 'main'),
 ]
 

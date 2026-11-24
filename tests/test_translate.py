@@ -96,3 +96,25 @@ def test_domain_gap_tool(tmp_path, repo, synth):
     assert real['hf_energy_ratio_vs_ref'] == pytest.approx(1.0) and real['denoise_profile_log_gap_vs_ref'] == 0
     assert len(real['denoise_loss_per_sigma']) == 16 and rep['resolution'] == 32
     assert (tmp_path / 'gap' / 'domain_gap.png').is_file()
+
+def test_style_mosaic_tool(tmp_path, repo, synth):
+    snap = _snapshot(tmp_path)
+    out = tmp_path / 'mosaic'
+    r = subprocess.run([sys.executable, 'tools/style_mosaic.py', '--device', 'cpu', '--network', str(snap),
+                        '--csv', synth['csv'], '--image-root', synth['root'], '--path-col', synth['path_col'],
+                        '--real', f'{synth["root"]}/images/disk', '--images', '2', '--variants', '2', '--max-rows', '3',
+                        '--sigma-start', '0.1,0.5', '--ilvr-factors', '0,4', '--steps', '3', '--outdir', str(out)],
+                       cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    for f in [0, 4]:
+        for kind in ['full', 'zoom', 'diff']:
+            # 2 images x 2 variants = 4 rows, 3 rows per page -> 2 pages
+            assert (out / f'{kind}_ilvr{f}_p1.png').is_file() and (out / f'{kind}_ilvr{f}_p2.png').is_file()
+    assert (out / 'grid2d_img0.png').is_file() and (out / 'grid2d_img1_zoom.png').is_file()
+    assert (out / 'metrics.png').is_file()
+    import pandas as pd
+    m = pd.read_csv(out / 'metrics.csv', keep_default_na=False)
+    assert list(m['setting'][:2]) == ['input', 'real'] and (m['setting'] == 'translated').sum() == 4
+    assert 'grain_vs_real' in m.columns and abs(float(m['grain_vs_real'][1]) - 1.0) < 1e-9
+    settings = json.load(open(out / 'settings.json'))
+    assert settings['sigma_start'] == [0.1, 0.5] and settings['ilvr_factors'] == [0, 4]

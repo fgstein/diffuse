@@ -27,82 +27,16 @@ Example:
 
 import os
 import sys
-import glob
 import json
 import click
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from training.dataset import load_image, CSVImageDataset # pylint: disable=wrong-import-position
+from training.translation import luminance, radial_spectrum, grain_std, sharpness, load_image_set # pylint: disable=wrong-import-position
 
-IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
-NUM_BANDS = 32
 
 #----------------------------------------------------------------------------
-
-def load_set(path, resolution, channels, max_images, path_col, seed=0):
-    """Return uint8 tensor [N, C, H, W]."""
-    if '@' in path:
-        csv_path, root = path.split('@', 1)
-        ds = CSVImageDataset(csv=csv_path, image_root=root, path_col=path_col, label_col=None, split='all',
-                             resolution=resolution, channels=channels, use_labels=False, max_size=max_images)
-        return torch.stack([torch.as_tensor(ds[i][0]) for i in range(len(ds))])
-    if path.lower().endswith('.zip') or os.path.isfile(os.path.join(path, 'dataset.json')):
-        ds = CSVImageDataset(data=path, split='all', resolution=resolution, channels=channels,
-                             use_labels=False, max_size=max_images)
-        return torch.stack([torch.as_tensor(ds[i][0]) for i in range(len(ds))])
-    files = sorted(f for f in glob.glob(os.path.join(path, '**', '*'), recursive=True)
-                   if f.lower().endswith(IMAGE_EXTS) and os.path.basename(f) not in ('compare.png', 'grid.png'))
-    if not files:
-        raise click.ClickException(f'No images under {path}')
-    if max_images and len(files) > max_images:
-        sel = np.sort(np.random.RandomState(seed).permutation(len(files))[:max_images])
-        files = [files[i] for i in sel]
-    imgs = []
-    for f in files:
-        with open(f, 'rb') as fh:
-            imgs.append(torch.as_tensor(load_image(fh, resolution=resolution, channels=channels, name=f)))
-    return torch.stack(imgs)
-
-def luminance(x):
-    """uint8 [N,C,H,W] -> float [N,H,W] in 0-255."""
-    x = x.to(torch.float64)
-    if x.shape[1] == 3:
-        return 0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]
-    return x[:, 0]
-
-def radial_spectrum(lum):
-    """Mean log10 power per radial frequency band (normalised frequency 0..0.5)."""
-    N, H, W = lum.shape
-    win = torch.outer(torch.hann_window(H, periodic=False, dtype=torch.float64), torch.hann_window(W, periodic=False, dtype=torch.float64))
-    x = (lum - lum.mean(dim=(1, 2), keepdim=True)) * win
-    P = torch.fft.fftshift(torch.fft.fft2(x).abs().square(), dim=(-2, -1)).mean(0) / (H * W)
-    fy = torch.fft.fftshift(torch.fft.fftfreq(H, dtype=torch.float64))
-    fx = torch.fft.fftshift(torch.fft.fftfreq(W, dtype=torch.float64))
-    r = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
-    edges = torch.linspace(0, 0.5, NUM_BANDS + 1, dtype=torch.float64)
-    centers, power = [], []
-    for b in range(NUM_BANDS):
-        m = (r >= edges[b]) & (r < edges[b + 1])
-        if b == 0:
-            m &= r > 0 # skip DC
-        centers.append(float((edges[b] + edges[b + 1]) / 2))
-        power.append(float(P[m].mean()) if m.any() else float('nan'))
-    return np.array(centers), np.array(power)
-
-def grain_std(lum):
-    """Immerkaer's fast noise variance estimate, averaged over images (0-255 units)."""
-    M = torch.tensor([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=torch.float64)[None, None]
-    y = torch.nn.functional.conv2d(lum[:, None], M)
-    H, W = lum.shape[1:]
-    return float((np.sqrt(np.pi / 2) / (6 * (W - 2) * (H - 2)) * y.abs().sum(dim=(1, 2, 3))).mean())
-
-def sharpness(lum):
-    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float64)[None, None] / 8
-    gx = torch.nn.functional.conv2d(lum[:, None], kx)
-    gy = torch.nn.functional.conv2d(lum[:, None], kx.transpose(-1, -2))
-    return float(torch.sqrt(gx ** 2 + gy ** 2).mean())
 
 #----------------------------------------------------------------------------
 
@@ -145,7 +79,10 @@ def main(sets, reference, network_pkl, resolution, channels, max_images, path_co
     report = dict(resolution=resolution, reference=reference, sets={})
     spectra = {}
     for name, path in named:
-        x = load_set(path, resolution, channels, max_images, path_col)
+        try:
+            x = load_image_set(path, resolution, channels, max_images, path_col)
+        except IOError as e:
+            raise click.ClickException(str(e))
         lum = luminance(x)
         f, p = radial_spectrum(lum)
         spectra[name] = (f, p)

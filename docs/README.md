@@ -8,7 +8,7 @@
 | 4 | [Monitoring](monitoring.md) | run directory contents, validation loss, per-σ curves, grids, memorization check |
 | 5 | [Sampling](sampling.md) | `generate.py`: classes, CFG, guidance interval, grids, determinism |
 | 6 | [Going to 224 px](224px.md) | patching, low-resolution attention, noise shift, gradient checkpointing |
-| 6b | [Sim-to-real style transfer](style-transfer.md) | SDEdit / ILVR translation of simulated images, choosing σ₀, measuring the domain gap |
+| 6b | [Sim-to-real style transfer](style-transfer.md) | SDEdit / ILVR translation of simulated images, tuning σ₀ with mosaics, measuring the domain gap |
 | 7 | [Conditioning & extensions](conditioning.md) | how conditions flow, NULL token, adding a new condition |
 | 8 | [How it works](how-it-works.md) | EDM formulation, CFG maths, code map, snapshot and state file contents |
 | 9 | [Troubleshooting](troubleshooting.md) | out of memory, slow data loading, NaN, resume errors, odd samples |

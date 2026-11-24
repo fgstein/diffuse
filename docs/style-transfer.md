@@ -3,19 +3,21 @@
 Use a model trained on **real** images to make **simulated** images look real at the level of **blur, grain, sensor noise and fine texture**, while keeping the **scene and the class**. Nothing new has to be trained: the tool works on any network snapshot.
 
 ```bash
-# 1. Sweep the starting noise level on a few images (unconditional)
-python tools/translate.py --network runs/<run>/network-snapshot-XXXXXX.pkl \
-    --csv /data/sim.csv --image-root /data/sim --sigma-start 0.05,0.1,0.2,0.4,0.8 \
-    --max-images 64 --outdir sweep
+# 1. Tune the style level: annotated mosaics across sigma_start (and ILVR), vs held-out real images
+python tools/style_mosaic.py --network runs/<run>/network-snapshot-XXXXXX.pkl \
+    --csv /data/sim.csv --image-root /data/sim --real /data/real-holdout.csv@/data/images \
+    --images 8 --sigma-start 0.02,0.05,0.1,0.2,0.4,0.8 --ilvr-factors 0,8 --outdir mosaic
 
-# 2. Measure the gap to HELD-OUT real images for each setting
+# 2. (optional) Confirm on more images with the full domain-gap report
+python tools/translate.py --network runs/<run>/network-snapshot-XXXXXX.pkl \
+    --csv /data/sim.csv --image-root /data/sim --sigma-start 0.1,0.2 --ilvr-factor 8 --max-images 256 --outdir sweep
 python tools/domain_gap.py --network runs/<run>/network-snapshot-XXXXXX.pkl \
     --set real=/data/real-holdout.csv@/data/images --set sim=/data/sim.csv@/data/sim \
-    --set s0.1=sweep/sigma-0.1 --set s0.2=sweep/sigma-0.2 --set s0.4=sweep/sigma-0.4 --outdir gap
+    --set s0.1=sweep/sigma-0.1 --set s0.2=sweep/sigma-0.2 --outdir gap
 
-# 3. Translate everything with the chosen setting (add ILVR to lock the scene)
+# 3. Translate everything with the chosen setting
 python tools/translate.py --network runs/<run>/network-snapshot-XXXXXX.pkl \
-    --csv /data/sim.csv --image-root /data/sim --sigma-start 0.4 --ilvr-factor 8 --outdir sim2real
+    --csv /data/sim.csv --image-root /data/sim --sigma-start 0.2 --ilvr-factor 8 --outdir sim2real
 ```
 
 ## When it is the right tool
@@ -74,7 +76,48 @@ Without `--label-col`, translation uses the NULL label, i.e. the model's uncondi
 
 With `--label-col` (CSV labels, same names as in training), translation is conditioned on each image's class. `--guidance w > 1` adds CFG, but CFG strengthens class stereotypes, which is the opposite of what you want for translation. Keep w ≤ 1.5, or stay unconditional.
 
-## Choosing the settings
+## Tuning the style level with mosaics
+
+`tools/style_mosaic.py` translates a small selection of simulated images at several σ₀ (and optionally several ILVR factors), then writes annotated mosaics that make the realism / fidelity trade-off visible. Every column uses **the same seed** for a given image and variant, so differences between columns come from the settings only.
+
+| File | Layout | What to look at |
+|---|---|---|
+| `full_ilvr<N>.png` | rows = images (× variants); columns = input \| σ₀ values \| real reference(s) | Scene and class still right? The red box on the input marks the zoom region. |
+| `zoom_ilvr<N>.png` | same layout, zoomed crops (nearest neighbour, ≥ 128 px tiles) | **Grain, noise and blur.** At 224 px these are invisible at full-image scale, so judge the style here, side by side with the real column. |
+| `diff_ilvr<N>.png` | \|output − input\| × `--diff-gain` | What each setting changed. Fine speckle and thin edges = style; **visible shapes = scene drift**. |
+| `grid2d_img<i>.png`, `…_zoom.png` | one image: rows = ILVR factor, columns = σ₀ | Only with several `--ilvr-factors`. Shows how ILVR lets you push σ₀ further. |
+| `metrics.png` | grain, sharpness, high-frequency energy and scene drift vs σ₀, one curve per ILVR factor | The **realism** curves should reach the dashed "real" line (1.0) while the **drift** curve stays low. |
+| `metrics.csv`, `settings.json` | the numbers and the settings | |
+
+`N = 0` in file names means plain SDEdit. Column headers repeat the column's grain, sharpness and HF energy, as ratios to the real images (`x real`) when `--real` is given, absolute values otherwise. Scene drift is the mean absolute change of the low-passed image (average-pool by res/28, i.e. 8 at 224 px), in 0–255 units.
+
+Main options (all in the [CLI reference](cli-reference.md#toolsstyle_mosaicpy)):
+
+| Option | Default | Notes |
+|---|---|---|
+| `--images`, `--select spread\|first\|random` | 8, spread | Pick images that cover the variety of the simulated set. Different classes or scene types each have their own breaking point. |
+| `--sigma-start` | `0.02,0.05,0.1,0.2,0.4,0.8` | Start broad, then refine around the transition. |
+| `--ilvr-factors` | `0` | e.g. `0,8,16` at 224 px. One set of mosaics per factor, plus the 2-D grids. |
+| `--variants K` | 1 | K stochastic variants per image (extra rows). Use 2–3 to see how variable the result is at a given σ₀. |
+| `--real PATH`, `--real-cols` | –, 1 | Held-out real images: dir, prepared zip/dir, or `CSV@ROOT`. Adds reference columns and makes every metric relative to real. |
+| `--crop auto\|center\|X,Y`, `--crop-size`, `--crop-zoom` | auto, res/4, 4 | `auto` picks the region with the most edges in each input, where blur and grain differences show best. Use `X,Y` to always look at the same place. |
+| `--diff-gain` | 4 | Amplification of the difference maps. |
+| `--label-col`, `--guidance` | unconditional | Same as `translate.py`. |
+| `--max-rows` | 16 | Rows per page (`…_p1.png`, `…_p2.png`). |
+
+The cost is `images × variants × len(sigma-start) × len(ilvr-factors)` translations. The defaults (8 images, 6 σ₀, 1 factor) take seconds on a GPU.
+
+### Suggested procedure
+
+1. **Broad sweep**, plain SDEdit, with held-out reals: `--sigma-start 0.02,0.05,0.1,0.2,0.4,0.8,1.6`.
+2. In `zoom_ilvr0.png`, find the σ₀ range where grain and edge sharpness look like the real column. In `metrics.png`, check that the grain / sharpness / HF curves cross 1.0 around there.
+3. In `full_ilvr0.png` and `diff_ilvr0.png`, find the largest σ₀ where scene and class are still intact (difference map = speckle and thin edges, no shapes).
+4. If the realistic σ₀ is **below** the drift limit, you are done: take the smallest σ₀ that reaches the real level.
+5. If it is **above** the drift limit, add ILVR: `--ilvr-factors 0,8,16` (at 224 px) and look at the `grid2d` images. Take the largest N that keeps the scene: smaller N re-imposes more of the simulator's blur.
+6. Refine around the chosen point with `--variants 3`, then confirm on a few hundred images with `translate.py` + `domain_gap.py`.
+7. Validate on the downstream task.
+
+## Choosing the settings without mosaics
 
 1. Run `translate.py` on 32–64 images with a σ₀ sweep, e.g. `0.05,0.1,0.2,0.4,0.8`. Look at `compare.png` (input | σ₁ | σ₂ | …) and find the largest σ₀ where the scene and class are still right.
 2. Run `domain_gap.py` against **held-out real images** (not the training images: see below). Prefer the setting where grain, sharpness and high-frequency energy are closest to 1.0 relative to real, and the denoising-profile gap is lowest.
@@ -143,6 +186,30 @@ The scene is locked even at σ₀ = 2. With N = 4 the edges become sharp like th
 The denoising-profile gap is measured on all classes.
 
 ![domain gap](style-transfer/domain-gap.png)
+
+### Mosaics on the demo
+
+`style_mosaic.py --images 6 --sigma-start 0.05,0.1,0.2,0.4,0.8,2 --ilvr-factors 0,4 --real <held-out reals>`:
+
+**ILVR N = 4, full images.** The last column is a random held-out real image. Headers give the column statistics relative to real.
+
+![full mosaic](style-transfer/mosaic-full_ilvr4.png)
+
+**SDEdit, zoom.** At 32 px the 8×8 region is zoomed ×16: the grain appears from σ₀ = 0.05, and edges sharpen from 0.4.
+
+![zoom mosaic](style-transfer/mosaic-zoom_ilvr0.png)
+
+**SDEdit, difference maps.** For the square (row 2), only edges and speckle change up to 0.8. In the plain stripe rows, a disk appears at σ₀ = 2: that is scene drift.
+
+![difference mosaic](style-transfer/mosaic-diff_ilvr0.png)
+
+**σ₀ × ILVR for one image.** Plain SDEdit deforms the square at σ₀ = 2; ILVR keeps it.
+
+![grid2d](style-transfer/mosaic-grid2d_img1.png)
+
+**Metric curves.** Sharpness and HF energy only reach the real level around σ₀ ≈ 2, where plain SDEdit drifts strongly; ILVR divides the drift by ~3. Grain overshoots in this demo because the invented stripes count as grain: compare classes separately when the curves look odd.
+
+![metrics](style-transfer/mosaic-metrics.png)
 
 ## Limitations and alternatives
 

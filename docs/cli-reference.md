@@ -194,6 +194,42 @@ Translate simulated images toward the real domain (SDEdit / ILVR).
 | `--ema-halflife` | MIMG |  | Pick a secondary EMA by half-life |
 | `--device` | cuda \| cpu |  | Device [default: cuda if available] |
 
+## `tools/style_mosaic.py`
+
+Annotated mosaics (full / zoom / difference / metrics) across sigma_start and ILVR factors.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--network` | PKL |  | **required.** Network snapshot trained on REAL images |
+| `--csv` | PATH |  | CSV listing the simulated images |
+| `--image-root` | DIR |  | Root of the relative paths in --csv |
+| `--input-dir` | DIR |  | Alternative to --csv: simulated images under DIR |
+| `--path-col` | TEXT | `path` | CSV column with relative paths |
+| `--label-col` | TEXT |  | CSV column with class labels (omit = unconditional) |
+| `--images` | INTEGER RANGE | `8` | Number of simulated images in the mosaic |
+| `--select` | spread \| first \| random | `spread` | Which images: evenly spread over the list, the first ones, or random |
+| `--sigma-start` | LIST | `0.02,0.05,0.1,0.2,0.4,0.8` | sigma_start values (columns) |
+| `--ilvr-factors` | LIST | `0` | ILVR factors (0 = plain SDEdit); one mosaic per factor |
+| `--variants` | INTEGER RANGE | `1` | Stochastic variants per image (extra rows) |
+| `--steps` | INTEGER RANGE | `16` | Heun steps from sigma_start to 0 |
+| `--guidance` | FLOAT | `1.0` | CFG weight (only with --label-col) |
+| `--ilvr-sigma-min` | FLOAT RANGE | `0.0` | Stop ILVR below this noise level |
+| `--real` | TEXT |  | Real reference images: dir, prepared zip/dir, or CSV@ROOT (held-out!) |
+| `--real-cols` | INTEGER RANGE | `1` | Real reference columns in the mosaics |
+| `--real-max` | INTEGER RANGE | `256` | Max real images used for the reference statistics |
+| `--crop` | TEXT | `auto` | Zoom region: 'auto' (most edges), 'center', or X,Y (top-left, in pixels) |
+| `--crop-size` | INTEGER RANGE |  | Zoom region size in pixels [default: resolution/4] |
+| `--crop-zoom` | INTEGER RANGE | `4` | Zoom factor of the crops (raised so that zoom tiles are >= 128 px) |
+| `--diff-gain` | FLOAT | `4.0` | Amplification of the difference maps |
+| `--tile-scale` | INTEGER RANGE | `0` | Upscale full tiles by this factor [default: auto, tiles >= 128 px] |
+| `--grid2d-images` | INTEGER RANGE | `2` | Images with a sigma x ILVR grid (when several factors) |
+| `--max-rows` | INTEGER RANGE | `16` | Rows per mosaic page |
+| `--seed` | INTEGER | `0` | Base seed |
+| `--batch` | INTEGER RANGE | `32` | Batch size |
+| `--ema-halflife` | MIMG |  | Pick a secondary EMA by half-life |
+| `--device` | cuda \| cpu |  | Device [default: cuda if available] |
+| `--outdir` | DIR |  | **required.** Output directory |
+
 ## `tools/domain_gap.py`
 
 Compare spectra, grain, sharpness and the model's denoising profile across image sets.

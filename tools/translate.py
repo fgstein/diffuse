@@ -24,6 +24,8 @@ Outputs, per sigma_start value:
     outdir/metadata.csv                        source, output, sigma_start, seed, label, ...
     outdir/compare.png                         input | sigma_1 | sigma_2 | ... for the first images
 
+To choose sigma_start / ILVR visually and quantitatively, use tools/style_mosaic.py.
+
 Examples:
     # sweep sigma_start on 32 images, unconditional
     python tools/translate.py --network snap.pkl --csv sim.csv --image-root /data/sim \\
@@ -37,38 +39,17 @@ Examples:
 import os
 import sys
 import csv
-import glob
 import click
-import numpy as np
 import torch
 import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import dnnlib # pylint: disable=wrong-import-position
 from torch_utils import distributed as dist # pylint: disable=wrong-import-position
-from training.dataset import load_image # pylint: disable=wrong-import-position
-from training.sampling import StackedRandomGenerator, edm_sampler, to_uint8, make_grid, save_image # pylint: disable=wrong-import-position
-
-IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
+from training.sampling import make_grid, save_image, to_uint8 # pylint: disable=wrong-import-position
+from training import translation as tr # pylint: disable=wrong-import-position
 
 def parse_float_list(s):
     return [float(x) for x in s.split(',') if x.strip()]
-
-def list_inputs(csv_path, image_root, input_dir, path_col, label_col):
-    """Return (root, [(relative path, label or '')])."""
-    if input_dir is not None:
-        files = sorted(f for f in glob.glob(os.path.join(input_dir, '**', '*'), recursive=True)
-                       if f.lower().endswith(IMAGE_EXTS))
-        if not files:
-            raise click.ClickException(f'No images found under {input_dir}')
-        return input_dir, [(os.path.relpath(f, input_dir), '') for f in files]
-    import pandas as pd
-    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    for c in [path_col, label_col]:
-        if c is not None and c not in df.columns:
-            raise click.ClickException(f'Column "{c}" not in {csv_path}; available: {list(df.columns)}')
-    labels = df[label_col].tolist() if label_col else [''] * len(df)
-    return image_root, list(zip(df[path_col].tolist(), labels))
 
 def sigma_tag(s):
     return f'sigma-{s:g}'
@@ -114,25 +95,26 @@ def main(network_pkl, csv_path, image_root, input_dir, path_col, label_col, outd
 
     net, label_json, _noise_config = load_network(network_pkl, device, ema_halflife)
     res, C = net.img_resolution, net.img_channels
-    root, items = list_inputs(csv_path, image_root, input_dir, path_col, label_col)
+    try:
+        root, items = tr.list_inputs(csv_path, image_root, input_dir, path_col, label_col)
+    except IOError as e:
+        raise click.ClickException(str(e))
     if max_images:
         items = items[:max_images]
 
-    # Conditioning: unconditional unless a label column is given.
-    label_to_idx = dict(label_json['label_to_idx']) if label_json else {}
+    # Conditioning: unconditional (NULL label) unless a label column is given.
     conditional = label_col is not None
+    label_to_idx = None
     if conditional:
-        if 'class' not in net.cond_stack.names:
-            raise click.ClickException('This network is unconditional; drop --label-col.')
-        unknown = sorted({l for _, l in items if l and l not in label_to_idx})
-        if unknown:
-            raise click.ClickException(f'Labels not in the snapshot label map: {unknown[:10]}')
-    null_idx = net.cond_stack.encoders['class'].null_index if 'class' in net.cond_stack.names else None
+        try:
+            label_to_idx = tr.check_labels(net, label_json, [l for _, l in items])
+        except ValueError as e:
+            raise click.ClickException(str(e))
     mode = f'conditional (guidance {guidance})' if conditional else 'unconditional'
     print(f'{len(items)} input(s) at {res}x{res}, {mode}, sigma_start {sigmas}, {num_steps} steps'
           + (f', ILVR factor {ilvr_factor}' if ilvr_factor > 1 else '') + f', {samples_per_image} variant(s) each')
 
-    # Jobs: (input index, variant k).
+    # Jobs: (input index, variant k). Seed of (i, k) = seed + i * K + k, identical for every sigma.
     jobs = [(i, k) for i in range(len(items)) for k in range(samples_per_image)]
     records = []
     compare = {} # input index -> {'in': img, sigma: img}
@@ -140,29 +122,16 @@ def main(network_pkl, csv_path, image_root, input_dir, path_col, label_col, outd
     for s in sigmas:
         for start in tqdm.trange(0, len(jobs), batch_size, desc=sigma_tag(s), unit='batch'):
             batch = jobs[start:start + batch_size]
-            imgs = []
-            for i, _k in batch:
-                rel = items[i][0]
-                try:
-                    with open(os.path.join(root, rel), 'rb') as f:
-                        imgs.append(load_image(f, resolution=res, channels=C, name=rel))
-                except Exception as e: # pylint: disable=broad-except
-                    raise click.ClickException(f'Cannot load "{rel}": {e}')
-            x_sim = torch.as_tensor(np.stack(imgs)).to(device).to(torch.float32) / 127.5 - 1
+            try:
+                x_sim = tr.load_inputs(root, [items[i][0] for i, _ in batch], res, C)
+            except IOError as e:
+                raise click.ClickException(str(e))
             seeds = [seed + i * samples_per_image + k for i, k in batch]
-            rnd = StackedRandomGenerator(device, seeds)
-            eps = rnd.randn(list(x_sim.shape), device=device)
-            cond = None
-            if null_idx is not None:
-                idx = [label_to_idx[items[i][1]] if (conditional and items[i][1]) else null_idx for i, _ in batch]
-                cond = {'class': torch.as_tensor(idx, dtype=torch.int64, device=device)}
-            with torch.no_grad():
-                out = edm_sampler(net, eps, cond, randn_like=rnd.randn_like, num_steps=num_steps,
-                                  guidance=(guidance if conditional else 1.0), x_init=x_sim, sigma_start=s,
-                                  ilvr_ref=(x_sim if ilvr_factor > 1 else None), ilvr_factor=ilvr_factor,
-                                  ilvr_sigma_min=ilvr_sigma_min)
-            out = to_uint8(out).cpu()
-            for (i, k), sd, img in zip(batch, seeds, out):
+            cond = tr.make_cond(net, [items[i][1] for i, _ in batch], label_to_idx, device)
+            out = tr.translate(net, x_sim, seeds, s, device, cond=cond, num_steps=num_steps,
+                               guidance=(guidance if conditional else 1.0), ilvr_factor=ilvr_factor,
+                               ilvr_sigma_min=ilvr_sigma_min, batch_size=len(batch))
+            for j, ((i, k), sd, img) in enumerate(zip(batch, seeds, out)):
                 rel = items[i][0]
                 orel = os.path.join(sigma_tag(s), out_rel(rel, k, samples_per_image))
                 os.makedirs(os.path.dirname(os.path.join(outdir, orel)), exist_ok=True)
@@ -171,7 +140,7 @@ def main(network_pkl, csv_path, image_root, input_dir, path_col, label_col, outd
                                     label=items[i][1] if conditional else '', guidance=guidance if conditional else '',
                                     ilvr_factor=ilvr_factor, steps=num_steps))
                 if i < num_compare and k == 0:
-                    entry = compare.setdefault(i, {'in': to_uint8(x_sim[batch.index((i, k))]).cpu()})
+                    entry = compare.setdefault(i, {'in': x_sim[j]})
                     entry[s] = img
 
     with open(os.path.join(outdir, 'metadata.csv'), 'wt', newline='') as f:
