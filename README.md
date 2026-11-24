@@ -15,10 +15,11 @@ A fork of NVIDIA's [EDM](https://github.com/NVlabs/edm) (Karras et al. 2022, *El
 - **Your data as it is**: a CSV with relative image paths and **string labels**, plus an image root. A validation and pre-resizing tool is included.
 - **Classifier-free guidance** with a learned NULL token, guidance interval, per-class generation by label name.
 - **Configurable resolution**: a 64×64 preset, and a native 224×224 preset in the Simple-Diffusion style (pixel patching, attention only at low resolution, noise shift, gradient checkpointing).
+- **Sim-to-real style transfer**: SDEdit / ILVR translation of simulated images with a trained model (unconditional by default), plus a domain-gap diagnostic (spectrum, grain, sharpness, denoising profile).
 - **Modular conditioning**: conditions are a dict of encoders, so further categorical or scalar attributes are small additions.
 - **Monitoring without pretrained metrics**: fixed-σ validation loss, per-σ training loss, fixed-seed sample grids, pixel-space memorization check.
 - **Sized for one RTX 3090 (24 GB)**: bf16 autocast, TF32, gradient accumulation, multiple EMAs, exact resume, graceful Ctrl-C.
-- Runs on **CPU** (slowly) for tests, with a 38-test CPU suite that runs in about 30 s.
+- Runs on **CPU** (slowly) for tests, with a 45-test CPU suite that runs in about 35 s.
 
 ## Quick start
 
@@ -54,6 +55,7 @@ uv run python generate.py --network runs/<run>/network-snapshot-XXXXXX.pkl --out
 | [Monitoring](docs/monitoring.md) | run directory, validation loss, per-σ curves, grids, memorization |
 | [Sampling](docs/sampling.md) | classes, CFG, guidance interval, outputs, Python API |
 | [Going to 224 px](docs/224px.md) | patching, attention placement, noise shift, checkpointing |
+| [Sim-to-real style transfer](docs/style-transfer.md) | SDEdit / ILVR, choosing σ₀, measuring the gap |
 | [Conditioning & extensions](docs/conditioning.md) | NULL token, adding new conditions |
 | [How it works](docs/how-it-works.md) | EDM maths, code map, file formats, differences from EDM |
 | [Troubleshooting](docs/troubleshooting.md) | common errors and fixes |
@@ -78,6 +80,8 @@ tools/
   make_synthetic_dataset.py tiny test dataset in the same format
   plot_stats.py             curves from stats.jsonl
   memorization_check.py     pixel-space nearest neighbours
+  translate.py              sim-to-real translation (SDEdit / ILVR)
+  domain_gap.py             spectrum / grain / sharpness / denoising-profile comparison of image sets
   gen_cli_reference.py      regenerates docs/cli-reference.md
 tests/                      pytest, CPU only
 docs/                       documentation + smoke-test results

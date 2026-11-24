@@ -22,6 +22,8 @@ SCRIPTS = [
     ('tools/make_synthetic_dataset.py', 'tools.make_synthetic_dataset', 'main'),
     ('tools/plot_stats.py', 'tools.plot_stats', 'main'),
     ('tools/memorization_check.py', 'tools.memorization_check', 'main'),
+    ('tools/translate.py', 'tools.translate', 'main'),
+    ('tools/domain_gap.py', 'tools.domain_gap', 'main'),
 ]
 
 def _default(p):

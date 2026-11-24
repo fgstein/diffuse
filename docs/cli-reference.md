@@ -137,6 +137,8 @@ Generate a small synthetic class-conditional dataset (PNGs + data.csv).
 | `--size` | INTEGER | `224` | Image size |
 | `--path-col` | TEXT | `path` | Name of the path column |
 | `--label-col` | TEXT | `label` | Name of the label column |
+| `--noise-std` | FLOAT | `6.0` | Gaussian grain std in 0-255 units |
+| `--blur` | FLOAT | `0.0` | Gaussian blur radius in pixels (0 = sharp) |
 | `--seed` | INTEGER | `0` | Random seed |
 
 ## `tools/plot_stats.py`
@@ -165,3 +167,46 @@ Find pixel-space nearest training neighbours of generated samples.
 | `--max-train` | INTEGER | `0` | Subsample the training set to at most N images (0 = all) |
 | `--num-pairs` | INTEGER | `32` | Number of closest pairs to save |
 | `--outdir` | TEXT |  | **required.** Output directory |
+
+## `tools/translate.py`
+
+Translate simulated images toward the real domain (SDEdit / ILVR).
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--network` | PKL |  | **required.** Network snapshot trained on REAL images |
+| `--csv` | PATH |  | CSV listing the simulated images |
+| `--image-root` | DIR |  | Root of the relative paths in --csv |
+| `--input-dir` | DIR |  | Alternative to --csv: translate every image under DIR |
+| `--path-col` | TEXT | `path` | CSV column with relative paths |
+| `--label-col` | TEXT |  | CSV column with class labels (omit = unconditional) |
+| `--outdir` | DIR |  | **required.** Output directory |
+| `--sigma-start` | LIST | `0.1` | Starting noise level(s); a list runs a sweep |
+| `--steps` | INTEGER RANGE | `16` | Heun steps from sigma_start to 0 |
+| `--guidance` | FLOAT | `1.0` | CFG weight (only with --label-col) |
+| `--ilvr-factor` | INTEGER RANGE | `0` | ILVR low-pass factor N (0 = off); must divide the resolution |
+| `--ilvr-sigma-min` | FLOAT RANGE | `0.0` | Stop ILVR below this noise level |
+| `--samples-per-image` | INTEGER RANGE | `1` | Stochastic variants per input |
+| `--seed` | INTEGER | `0` | Base seed (seed of image i, variant k = seed + i * K + k) |
+| `--max-images` | INTEGER RANGE |  | Only the first N inputs (for sweeps) |
+| `--compare` | INTEGER RANGE | `8` | Inputs shown in compare.png (0 = none) |
+| `--batch` | INTEGER RANGE | `32` | Batch size |
+| `--ema-halflife` | MIMG |  | Pick a secondary EMA by half-life |
+| `--device` | cuda \| cpu |  | Device [default: cuda if available] |
+
+## `tools/domain_gap.py`
+
+Compare spectra, grain, sharpness and the model's denoising profile across image sets.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--set` | TEXT |  | **required.** NAME=PATH (repeatable); PATH = image dir, prepared zip/dir, or CSV@ROOT |
+| `--reference` | TEXT |  | Name of the reference (real) set [default: first set] |
+| `--network` | TEXT |  | Real-data snapshot for the denoising-loss profile (optional) |
+| `--resolution` | INTEGER |  | Analysis resolution [default: network resolution, else 224] |
+| `--channels` | 1 \| 3 | `3` | Image channels |
+| `--max-images` | INTEGER RANGE | `256` | Max images per set |
+| `--path-col` | TEXT | `path` | Path column for CSV@ROOT sets |
+| `--batch` | INTEGER RANGE | `32` | Batch size for the denoising profile |
+| `--device` | cuda \| cpu |  | Device [default: cuda if available] |
+| `--outdir` | TEXT |  | **required.** Output directory (report.json, domain_gap.png) |

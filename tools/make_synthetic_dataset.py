@@ -7,6 +7,9 @@
 Writes 224x224 RGB PNGs in nested sub-folders (to exercise relative paths) and
 a CSV with relative paths and string labels.
 
+`--noise-std 0 --blur 4` makes a "simulated-looking" variant (no grain, soft
+edges) of the same kind of scenes, for testing sim-to-real translation.
+
 Example:
     python tools/make_synthetic_dataset.py --out /tmp/synth --n-per-class 30 --classes 3
 """
@@ -17,13 +20,14 @@ import click
 import numpy as np
 import PIL.Image
 import PIL.ImageDraw
+import PIL.ImageFilter
 
 CLASS_NAMES = ['disk', 'square', 'stripes', 'triangle', 'ring', 'cross', 'checker', 'gradient']
 
 def _rand_color(rnd, lo=30, hi=230):
     return tuple(int(c) for c in rnd.randint(lo, hi, size=3))
 
-def draw_sample(name, rnd, size=224):
+def draw_sample(name, rnd, size=224, noise_std=6.0, blur=0.0):
     bg = tuple(int(c) for c in rnd.randint(200, 256, size=3))
     img = PIL.Image.new('RGB', (size, size), bg)
     d = PIL.ImageDraw.Draw(img)
@@ -63,8 +67,11 @@ def draw_sample(name, rnd, size=224):
         img = PIL.Image.fromarray(arr.astype(np.uint8))
     else:
         raise ValueError(name)
-    arr = np.asarray(img).astype(np.float32) + rnd.randn(size, size, 3) * 6.0 # light noise
-    return PIL.Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+    if blur > 0:
+        img = img.filter(PIL.ImageFilter.GaussianBlur(radius=blur))
+    noise = rnd.randn(size, size, 3) # always drawn, so the scene RNG stream does not depend on noise_std
+    arr = np.asarray(img).astype(np.float32) + noise * noise_std # grain
+    return PIL.Image.fromarray(arr.clip(0, 255).round().astype(np.uint8))
 
 @click.command()
 @click.option('--out', help='Output directory', required=True, type=str)
@@ -73,8 +80,10 @@ def draw_sample(name, rnd, size=224):
 @click.option('--size', help='Image size', default=224, show_default=True, type=int)
 @click.option('--path-col', help='Name of the path column', default='path', show_default=True)
 @click.option('--label-col', help='Name of the label column', default='label', show_default=True)
+@click.option('--noise-std', help='Gaussian grain std in 0-255 units', default=6.0, show_default=True, type=float)
+@click.option('--blur', help='Gaussian blur radius in pixels (0 = sharp)', default=0.0, show_default=True, type=float)
 @click.option('--seed', help='Random seed', default=0, show_default=True, type=int)
-def main(out, n_per_class, classes, size, path_col, label_col, seed):
+def main(out, n_per_class, classes, size, path_col, label_col, noise_std, blur, seed):
     """Generate a small synthetic class-conditional dataset (PNGs + data.csv)."""
     import pandas as pd
     rnd = np.random.RandomState(seed)
@@ -83,7 +92,7 @@ def main(out, n_per_class, classes, size, path_col, label_col, seed):
         for i in range(n_per_class):
             rel = f'images/{name}/part{i % 3}/img_{ci:02d}_{i:05d}.png'
             os.makedirs(os.path.join(out, os.path.dirname(rel)), exist_ok=True)
-            draw_sample(name, rnd, size).save(os.path.join(out, rel))
+            draw_sample(name, rnd, size, noise_std, blur).save(os.path.join(out, rel))
             rows.append({path_col: rel, label_col: name})
     order = rnd.permutation(len(rows)) # shuffle rows so classes are interleaved
     pd.DataFrame([rows[i] for i in order]).to_csv(os.path.join(out, 'data.csv'), index=False)

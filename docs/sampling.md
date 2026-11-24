@@ -117,3 +117,7 @@ images = generate(net, seeds=list(range(16)), class_indices=[idx] * 16, device='
 ```
 
 The code is pickled with the snapshot (EDM's `persistence`), so snapshots remain loadable after the source is edited, as long as the repository is on the Python path.
+
+## Image-to-image
+
+`edm_sampler(..., x_init=images, sigma_start=σ₀)` starts from a noised input image instead of pure noise (SDEdit), and `ilvr_ref` / `ilvr_factor` add the ILVR low-frequency constraint. The command-line front-end is `tools/translate.py`; see [sim-to-real style transfer](style-transfer.md).

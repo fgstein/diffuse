@@ -45,7 +45,7 @@ You can prefix every command with `uv run`, or activate the environment once wit
 ## 4. Run the test suite
 
 ```bash
-uv run pytest -q        # CPU only, ~30 s, 38 tests
+uv run pytest -q        # CPU only, ~35 s, 45 tests
 ```
 
 The tests build a tiny synthetic dataset and cover the dataset, the network, sampling with CFG, snapshot loading in a fresh process, and the CLI with its presets.
